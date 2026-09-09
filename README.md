@@ -3,9 +3,9 @@
 A from-scratch, small (~313M param) diffusion-transformer robot policy built
 on **Wan2.1**'s architecture (VAE + DiT block design), not its pretrained
 weights — the DiT is trained fully from random init here, only the video VAE
-is frozen and reused. Separate sub-project from the top-level
-[`README.md`](README.md)'s MAE-based WorldDiT reconstruction; shares the
-`scripts/` directory but no code.
+is frozen and reused. Separate sub-project from
+[`README_worlddit.md`](README_worlddit.md)'s MAE-based WorldDiT
+reconstruction; shares the `scripts/` directory but no code.
 
 ## Model architecture
 
@@ -74,7 +74,7 @@ scripts/outputs/<run-name>/checkpoint.pt   training checkpoints (per --output)
 | `google/umt5-xxl` tokenizer files | ~1MB | text cache precompute only | **auto** — `AutoTokenizer.from_pretrained` fetches on first run, cached under `~/.cache/huggingface` |
 | `Wan2.1_DiT_1.3B.safetensors` | 5.7GB | **not used** by the current from-scratch model | manual, only if resuming the separate pretrained-1.3B/LoRA path (`batch_size_sweep.py`) |
 | raw LIBERO-Object HDF5 demos | — | training/eval data | pre-existing in this environment, not part of this sub-project's setup |
-| LIBERO/robosuite checkout (`~/LIBERO`) | — | `rollout_eval_tower.py` only | pre-existing, see the top-level `README.md` |
+| LIBERO/robosuite checkout (`~/LIBERO`) | — | `rollout_eval_tower.py` only | pre-existing in this environment, not documented in either README |
 
 Manual downloads (into `worlddit_ref/dependencies/`):
 ```bash
