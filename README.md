@@ -7,6 +7,26 @@ is frozen and reused. Separate sub-project from
 [`README_worlddit.md`](README_worlddit.md)'s MAE-based WorldDiT
 reconstruction; shares the `scripts/` directory but no code.
 
+## Prerequisites
+
+**wandb login** — `train_wan_tower.py` logs to wandb by default (pass `--no-wandb` to skip):
+```bash
+wandb login
+```
+
+**`wdit_tower` conda env** — `wdit` and `wdit_eval` are assumed already set up (shared with
+the sibling WorldDiT sub-project). `wdit_tower` is specific to this one: it's needed only
+for `precompute_text_embeddings.py`, which requires a newer `huggingface_hub`/`transformers`
+than `wdit`'s lerobot-compatible pin allows (`AutoTokenizer` fails to import otherwise —
+`cannot import name 'is_offline_mode' from 'huggingface_hub'`). Set up once:
+```bash
+conda create -y --name wdit_tower --clone wdit
+conda activate wdit_tower
+pip install -q peft   # pulls in a compatible newer huggingface_hub/transformers as a side effect
+```
+Nothing else needs installing — `ftfy` (used by `wan_tokenizers.py`) is already present via
+the `wdit` clone. `wdit_tower` is not used for training or eval, only that one precompute step.
+
 ## Model architecture
 
 ```
