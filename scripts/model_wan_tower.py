@@ -289,3 +289,54 @@ def load_trainable_state(model: "WanTowerPolicy", path) -> None:
     bad_missing = [k for k in missing if not k.startswith("vae_model.")]
     if bad_missing or unexpected:
         raise RuntimeError(f"checkpoint load mismatch -- missing (non-frozen): {bad_missing}, unexpected: {unexpected}")
+
+
+def load_partial_state(model: "WanTowerPolicy", path, verbose: bool = True) -> dict:
+    """Load whatever tensors from a checkpoint at `path` structurally match
+    the current model -- same key name AND same shape -- and silently skip
+    the rest, leaving them at their (random) init. Meant for transferring
+    weights across architecture variants that mostly overlap but differ in
+    a few resized/new modules -- e.g. going from a UMT5 (text_dim=4096) or
+    original CLIP-pooled checkpoint to this CLIP-per-token-cross-attention
+    model (text_dim=512): every dit.block's self_attn/ffn and even
+    cross_attn's own q/k/v/o transfer cleanly (those Linear layers map
+    dim->dim, independent of the text encoder's width), only
+    dit.text_embedding's first layer (sized by text_dim) and its own second
+    layer's calibration are actually new. Unlike load_trainable_state, this
+    never raises on mismatch -- a shape or key mismatch just means "train
+    that piece from scratch," which is the whole point of a partial load.
+    Prints exactly what loaded vs. what didn't, since a silent partial load
+    is a common source of "why isn't this learning" confusion later.
+    Returns the checkpoint dict actually applied (for logging/inspection)."""
+    device = next(model.parameters()).device
+    ckpt_state = torch.load(str(path), map_location=device, weights_only=True)
+    model_state = model.state_dict()
+
+    to_load = {}
+    skipped_shape = []
+    skipped_missing_in_model = []
+    for k, v in ckpt_state.items():
+        if k not in model_state:
+            skipped_missing_in_model.append(k)
+            continue
+        if model_state[k].shape != v.shape:
+            skipped_shape.append((k, tuple(v.shape), tuple(model_state[k].shape)))
+            continue
+        to_load[k] = v
+
+    model.load_state_dict(to_load, strict=False)
+    never_touched = [k for k in model_state if k not in to_load and not k.startswith("vae_model.")]
+
+    if verbose:
+        print(f"partial checkpoint load from {path}:")
+        print(f"  loaded {len(to_load)} tensors unchanged (matching key + shape)")
+        if skipped_shape:
+            print(f"  skipped {len(skipped_shape)} tensors (shape mismatch -- training these from random init):")
+            for k, old_shape, new_shape in skipped_shape:
+                print(f"    {k}: checkpoint {old_shape} vs model {new_shape}")
+        if skipped_missing_in_model:
+            print(f"  {len(skipped_missing_in_model)} checkpoint tensors have no matching key in this model "
+                  f"(ignored): {skipped_missing_in_model}")
+        if never_touched:
+            print(f"  {len(never_touched)} model tensors had no checkpoint match at all (random init): {never_touched}")
+    return to_load

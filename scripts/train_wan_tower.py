@@ -20,7 +20,9 @@ import numpy as np
 import torch
 
 from data_wan_tower import LiberoWanTowerDataset, collate_tower, split_train_val_demos
-from model_wan_tower import WanTowerPolicy, soft_bin_target, soft_ce_loss, save_trainable_state, HEATMAP_BINS
+from model_wan_tower import (
+    WanTowerPolicy, soft_bin_target, soft_ce_loss, save_trainable_state, load_partial_state, HEATMAP_BINS,
+)
 from clip_text_sequence import clip_encode_text_sequence
 
 
@@ -109,6 +111,13 @@ def main():
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--output", default=None,
                     help="dir to save the checkpoint in (e.g. outputs/tower-run1); omit to skip saving")
+    p.add_argument("--init-from", default=None,
+                    help="partially initialize from a prior checkpoint.pt (e.g. from a different text-encoder "
+                         "variant) -- loads only tensors whose key AND shape match the current model, skips "
+                         "the rest (they train from random init). See model_wan_tower.py's load_partial_state "
+                         "for exactly what transfers: DiT self_attn/ffn/cross_attn (dim->dim, independent of "
+                         "text_dim) and the action/heatmap heads carry over; dit.text_embedding's first layer "
+                         "(sized by text_dim) does not if the source used a different text encoder.")
     p.add_argument("--ckpt-every", type=int, default=0,
                     help="also save (overwriting the same checkpoint.pt) every N steps, not just once per "
                          "epoch; 0 = epoch-end only (default). Matters once an epoch takes long enough that "
@@ -126,6 +135,8 @@ def main():
         out_dim=16, num_heads=args.dit_heads, num_layers=args.dit_blocks, text_len=77, in_dim=16,
     )
     model = WanTowerPolicy(args.vae, None, dit_config).to(device)
+    if args.init_from:
+        load_partial_state(model, args.init_from)
     model.train()
     n_total = sum(p_.numel() for p_ in model.parameters())
     n_trainable = sum(p_.numel() for p_ in model.parameters() if p_.requires_grad)
