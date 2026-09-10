@@ -23,23 +23,15 @@ from data_wan_tower import LiberoWanTowerDataset, collate_tower, split_train_val
 from model_wan_tower import WanTowerPolicy, soft_bin_target, soft_ce_loss, save_trainable_state, HEATMAP_BINS
 
 
-def lookup_text_embeddings(instructions, text_cache, device):
-    """instructions: list[str]. text_cache: dict from precompute_text_embeddings.py
-    (instructions/embeddings/lengths, all instructions padded to the same
-    length so a plain index_select is enough -- no per-batch padding needed).
-    Returns (text_embed_seq (B,L,4096), text_context_lens (B,))."""
-    idxs = torch.tensor([text_cache["instr_to_idx"][instr] for instr in instructions], dtype=torch.long)
-    text_embed_seq = text_cache["embeddings"][idxs].to(device)
-    text_context_lens = text_cache["lengths"][idxs].to(device)
-    return text_embed_seq, text_context_lens
-
-
-def compute_losses(model, batch, text_cache, clip_mean, clip_std, device, w_action, w_heatmap, eval_seed=None):
+def compute_losses(model, batch, clip_model, clip_mean, clip_std, device, w_action, w_heatmap, eval_seed=None):
     primary = (batch["image_primary"].to(device) * clip_std + clip_mean) * 2 - 1
     action_target = batch["action_target"].to(device)
     future_px = batch["future_px_primary"].to(device)
 
-    text_embed_seq, text_context_lens = lookup_text_embeddings(batch["instruction"], text_cache, device)
+    with torch.no_grad():
+        text_embed = clip_model.encode_text(
+            clip.tokenize(batch["instruction"], truncate=True).to(device)
+        ).float()
 
     cpu_rng_state = cuda_rng_state = None
     if eval_seed is not None:
@@ -53,7 +45,7 @@ def compute_losses(model, batch, text_cache, clip_mean, clip_std, device, w_acti
         if device == "cuda":
             torch.cuda.manual_seed(eval_seed)
 
-    pred_v, pred_hm, target_v = model(primary, text_embed_seq, text_context_lens, action_target=action_target)
+    pred_v, pred_hm, target_v = model(primary, text_embed, action_target=action_target)
 
     if eval_seed is not None:
         torch.set_rng_state(cpu_rng_state)
@@ -78,11 +70,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--raw-dir", default="/home/ubuntu/dev/wdit/data/libero_object_raw")
     p.add_argument("--vae", default="../worlddit_ref/dependencies/Wan2.1_VAE.pth")
-    p.add_argument("--clip", default="../worlddit_ref/dependencies/ViT-B-32.pt",
-                    help="CLIP is used only for image preprocessing now -- text conditioning comes from "
-                         "the precomputed UMT5 cache (--text-cache), not CLIP's text tower")
-    p.add_argument("--text-cache", default="/home/ubuntu/dev/wdit/data/libero_object_raw/text_embeddings_umt5.pt",
-                    help="from precompute_text_embeddings.py")
+    p.add_argument("--clip", default="../worlddit_ref/dependencies/ViT-B-32.pt")
     p.add_argument("--dit-dim", type=int, default=1024)
     p.add_argument("--dit-blocks", type=int, default=10)
     p.add_argument("--dit-heads", type=int, default=16)
@@ -141,18 +129,10 @@ def main():
     print(f"DiT config: dim={args.dit_dim} blocks={args.dit_blocks} heads={args.dit_heads} ffn={args.dit_ffn}")
     print(f"total params: {n_total:,}  trainable: {n_trainable:,}")
 
-    _, preprocess = clip.load(args.clip, device="cpu")  # image preprocessing only; text goes through UMT5 now
+    clip_model, preprocess = clip.load(args.clip, device="cpu")
+    clip_model = clip_model.to(device).eval()
     clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 1, 3, 1, 1)
     clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 1, 3, 1, 1)
-
-    text_cache_raw = torch.load(args.text_cache, weights_only=True)
-    text_cache = {
-        "instr_to_idx": {instr: i for i, instr in enumerate(text_cache_raw["instructions"])},
-        "embeddings": text_cache_raw["embeddings"],
-        "lengths": text_cache_raw["lengths"],
-    }
-    print(f"text cache: {len(text_cache_raw['instructions'])} instructions, "
-          f"embeddings {tuple(text_cache_raw['embeddings'].shape)}")
 
     splits = split_train_val_demos(args.raw_dir, val_demos_per_task=args.val_demos_per_task, seed=0)
     train_map = {task: ids[0] for task, ids in splits.items()}
@@ -189,7 +169,7 @@ def main():
 
             t0 = time.perf_counter()
             loss_action, loss_heatmap, total_loss = compute_losses(
-                model, batch, text_cache, clip_mean, clip_std, device, args.w_action, args.w_heatmap
+                model, batch, clip_model, clip_mean, clip_std, device, args.w_action, args.w_heatmap
             )
             optimizer.zero_grad(set_to_none=True)
             total_loss.backward()
@@ -228,7 +208,7 @@ def main():
                 eval_batch = collate_with_instruction(eval_samples)
                 with torch.no_grad():
                     ev_action, ev_heatmap, ev_total = compute_losses(
-                        model, eval_batch, text_cache, clip_mean, clip_std, device,
+                        model, eval_batch, clip_model, clip_mean, clip_std, device,
                         args.w_action, args.w_heatmap, eval_seed=args.eval_seed,
                     )
                 model.train()

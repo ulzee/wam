@@ -18,24 +18,11 @@ tested smoke test, not the final architecture):
 What's NOT simplified: Wan's own pretrained weights (VAE + DiT blocks) are
 used and fine-tuned as-is, loaded via the vendored wan_vae.py/wan_dit.py.
 The 5-frame (1 anchor + 1x4 chunk) context window genuinely exercises the
-VAE's native causal-conv temporal chunking. New tokens (action target,
-heatmap-query) are appended to the video token sequence -- verified that
-Wan's own rope_apply leaves any tokens beyond the video grid's f*h*w
-length completely unrotated (identity), so this required zero modification
-to Wan's own block/attention code to support cleanly.
-
-Text conditioning goes through Wan's own native per-block cross-attention,
-not a token in the self-attention stream: real per-token UMT5-XXL embeddings
-(precompute_text_embeddings.py) are projected by Wan's own dit.text_embedding
-(sized for text_dim=4096, previously unused/zero-gradient in every run since
-nothing fed it real input) and passed as `context` to every block's
-cross_attn. An earlier version used a single pooled CLIP embedding folded
-into self-attention, with the real cross-attn path fed constant zeros --
-verified (via a causal test: swapping the instruction while holding video
-fixed) that this made the model provably unable to use the instruction at
-all. Both the richer per-token encoder and the dedicated per-block
-cross-attention pathway are real fixes for that failure, not just a bigger
-model for its own sake.
+VAE's native causal-conv temporal chunking. New tokens (text, action
+target, heatmap-query) are appended to the video token sequence -- verified
+that Wan's own rope_apply leaves any tokens beyond the video grid's
+f*h*w length completely unrotated (identity), so this required zero
+modification to Wan's own block/attention code to support cleanly.
 
 No robot-state input: deliberately excluded. Proprioceptive state (EE
 pose/gripper) is embodiment-specific and was cut so the model only ever
@@ -102,12 +89,9 @@ class WanTowerPolicy(nn.Module):
         self.vae_model.requires_grad_(False)
 
         self.dit = WanModel(**dit_config)  # pretrained weights loaded by caller (if any), then fine-tuned
-        # self.dit.text_embedding (Linear(text_dim=4096, DIM) -> GELU -> Linear(DIM, DIM)) is Wan's
-        # OWN native text projection, sized for real T5/UMT5 embeddings -- reused as-is below to feed
-        # the DiT's own per-block cross-attention (previously fed constant zeros, see cross-attn note
-        # in forward()). No separate text_embedding module needed here anymore.
 
         # new, small, trainable heads -- everything below is new, nothing pretrained
+        self.text_embedding = nn.Sequential(nn.Linear(512, DIM), nn.GELU(), nn.Linear(DIM, DIM))  # replaces Wan's umT5-sized text_embedding; CLIP (512-d) in
         self.action_tokenizer = nn.Sequential(nn.Linear(7, DIM * 2), nn.GELU(), nn.Linear(DIM * 2, DIM))
         self.action_detokenizer = nn.Sequential(nn.Linear(DIM, DIM * 2), nn.GELU(), nn.Linear(DIM * 2, 7))
         self.action_query = nn.Parameter(torch.randn(1, ACTION_HORIZON, DIM) * 0.02)
@@ -145,12 +129,10 @@ class WanTowerPolicy(nn.Module):
         tokens = tokens.flatten(2).transpose(1, 2)  # (B, 2*14*14, DIM)
         return tokens, grid
 
-    def forward(self, primary_5frame, text_embed_seq, text_context_lens, action_target=None, tau=None,
+    def forward(self, primary_5frame, text_embed, action_target=None, tau=None,
                 noisy_action=None, video_tokens=None, grid=None):
         """primary_5frame: (B,5,3,224,224) in [-1,1].
-        text_embed_seq: (B,L,4096) padded per-token UMT5-XXL embeddings (see
-        precompute_text_embeddings.py); text_context_lens: (B,) each sample's
-        real (unpadded) token count, for cross-attention masking.
+        text_embed: (B,512) pooled CLIP text embedding.
         action_target: (B,7,7) clean actions, for building the flow-matching
         noisy input during training; ignored if noisy_action is given.
         tau: (B,) flow-matching timestep in [0,1]; if None, sampled here.
@@ -164,12 +146,6 @@ class WanTowerPolicy(nn.Module):
         Returns: pred_action_velocity (B,7,7), pred_heatmap_logits (B,7,2,20).
         No robot-state input -- conditions only on video + instruction, so
         nothing here is embodiment-specific.
-
-        Text conditioning goes through Wan's own native per-block
-        cross-attention now (self.dit.text_embedding projects text_embed_seq
-        to (B,L,DIM), used as `context` below), not a single token folded
-        into self-attention -- that path used to be fed constant zeros
-        (dummy_context), which is why it carried no information at all.
         """
         B = primary_5frame.shape[0]
         device = primary_5frame.device
@@ -180,8 +156,7 @@ class WanTowerPolicy(nn.Module):
         f, h, w = grid
         video_len = f * h * w
 
-        text_dtype = self.dit.text_embedding[0].weight.dtype
-        context = self.dit.text_embedding(text_embed_seq.to(text_dtype))  # (B, L, DIM)
+        text_tokens = self.text_embedding(text_embed).unsqueeze(1)  # (B,1,DIM)
 
         if tau is None:
             tau = torch.rand(B, device=device, dtype=primary_5frame.dtype)
@@ -197,9 +172,8 @@ class WanTowerPolicy(nn.Module):
         action_in = self.action_tokenizer(noisy_action) + self.action_query + self.action_type  # (B,7,DIM)
         heatmap_in = self.heatmap_query.expand(B, -1, -1) + self.heatmap_type  # (B,7,DIM)
 
-        x = torch.cat([video_tokens, action_in, heatmap_in], dim=1)
+        x = torch.cat([video_tokens, text_tokens, action_in, heatmap_in], dim=1)
         seq_len = x.shape[1]
-        context = context.to(x.dtype)
 
         # SIMPLIFICATION (documented above): one shared global timestep for
         # the whole sequence, Wan's native mechanism, unmodified. No outer
@@ -214,15 +188,18 @@ class WanTowerPolicy(nn.Module):
 
         grid_sizes = torch.tensor([[f, h, w]] * B, dtype=torch.long, device=device)
         seq_lens = torch.tensor([seq_len] * B, dtype=torch.long, device=device)
+        dummy_context = torch.zeros(B, 1, self.dit.dim, device=device, dtype=x.dtype)
+        context_lens = None
 
-        for block in self.dit.blocks:
-            x = block(
-                x, e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes,
-                freqs=self.dit.freqs, context=context, context_lens=text_context_lens,
-            )
+        if True:
+            for block in self.dit.blocks:
+                x = block(
+                    x, e=e0, seq_lens=seq_lens, grid_sizes=grid_sizes,
+                    freqs=self.dit.freqs, context=dummy_context, context_lens=context_lens,
+                )
 
-        action_out = x[:, video_len : video_len + ACTION_HORIZON]
-        heatmap_out = x[:, video_len + ACTION_HORIZON :]
+        action_out = x[:, video_len + 1 : video_len + 1 + ACTION_HORIZON]
+        heatmap_out = x[:, video_len + 1 + ACTION_HORIZON :]
         pred_velocity = self.action_detokenizer(action_out.to(self.action_detokenizer[0].weight.dtype))
         pred_heatmap_logits = self.heatmap_head(heatmap_out.to(self.heatmap_head[0].weight.dtype))
         pred_heatmap_logits = pred_heatmap_logits.view(B, ACTION_HORIZON, 2, HEATMAP_BINS)
@@ -230,13 +207,11 @@ class WanTowerPolicy(nn.Module):
         return pred_velocity, pred_heatmap_logits, target_velocity
 
     @torch.no_grad()
-    def generate(self, primary_5frame, text_embed_seq, text_context_lens, sampling_steps: int = 20,
-                 return_heatmap: bool = False):
+    def generate(self, primary_5frame, text_embed, sampling_steps: int = 20, return_heatmap: bool = False):
         """Inference entry point: encode the (frozen, unchanging) video
         context once, then flow-sample the action chunk via Euler
         integration -- same convention as WorldDiT's WorldModelSampler.sample
         (linspace 0->1 over sampling_steps, action += velocity/sampling_steps).
-        text_embed_seq/text_context_lens: see forward()'s docstring.
         Returns (B, ACTION_HORIZON, 7), or (action, pred_heatmap_logits) if
         return_heatmap -- the heatmap head's prediction from the FINAL
         sampling step (tau->1, once the action tokens have converged), since
@@ -250,7 +225,7 @@ class WanTowerPolicy(nn.Module):
         for t in torch.linspace(0.0, 1.0, sampling_steps + 1, device=device)[:-1]:
             tau = torch.full((B,), float(t.item()), device=device, dtype=dtype)
             velocity, pred_heatmap_logits, _ = self.forward(
-                primary_5frame, text_embed_seq, text_context_lens, tau=tau, noisy_action=action,
+                primary_5frame, text_embed, tau=tau, noisy_action=action,
                 video_tokens=video_tokens, grid=grid,
             )
             action = action + velocity / sampling_steps

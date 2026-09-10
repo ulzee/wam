@@ -144,11 +144,11 @@ class TowerPolicyRunner:
     execution_horizon actions before replanning. Ensemble logic is identical
     to rollout_eval.py's -- generic to any ACTION_HORIZON=7 chunk output."""
 
-    def __init__(self, model, preprocess, text_cache, sim, temperature: float,
+    def __init__(self, model, preprocess, clip_model, sim, temperature: float,
                  execution_horizon: int, max_steps: int, sampling_steps: int, device: str):
         self.model = model
         self.preprocess = preprocess
-        self.text_cache = text_cache
+        self.clip_model = clip_model
         self.sim = sim
         self.temperature = temperature
         self.execution_horizon = execution_horizon
@@ -162,9 +162,10 @@ class TowerPolicyRunner:
         self.predictions = torch.zeros(self.max_steps, self.max_steps + ACTION_HORIZON, 7, device=self.device)
         self.valid = torch.zeros(self.max_steps, self.max_steps + ACTION_HORIZON, dtype=torch.bool, device=self.device)
         self.last_traj_px = None  # (ACTION_HORIZON,2) predicted future (row,col), raw/unflipped convention
-        idx = self.text_cache["instr_to_idx"][instruction]
-        self.text_embed_seq = self.text_cache["embeddings"][idx : idx + 1].to(self.device)  # (1,L,4096)
-        self.text_context_lens = self.text_cache["lengths"][idx : idx + 1].to(self.device)
+        with torch.no_grad():
+            self.text_embed = self.clip_model.encode_text(
+                clip.tokenize([instruction], truncate=True).to(self.device)
+            ).float()
 
     def observe(self, observation):
         raw = observation["agentview_image"]  # raw/native MuJoCo convention, matches training storage
@@ -200,8 +201,7 @@ class TowerPolicyRunner:
         clip_frames = torch.cat(tuple(self.primary), dim=0).unsqueeze(0).to(self.device)  # (1,5,3,224,224)
         primary = (clip_frames * CLIP_STD.to(self.device) + CLIP_MEAN.to(self.device)) * 2 - 1
         chunk, heatmap_logits = self.model.generate(
-            primary, self.text_embed_seq, self.text_context_lens,
-            sampling_steps=self.sampling_steps, return_heatmap=True
+            primary, self.text_embed, sampling_steps=self.sampling_steps, return_heatmap=True
         )
         chunk = chunk[0]
         row_px = decode_heatmap_to_px(heatmap_logits[0, :, 0, :], image_size=IMG_SIZE)
@@ -210,7 +210,7 @@ class TowerPolicyRunner:
         return self.ensemble(chunk, timestep)
 
 
-def evaluate(args, model, preprocess, text_cache, device):
+def evaluate(args, model, preprocess, clip_model, device):
     from libero.libero import benchmark
     from libero.libero.envs import OffScreenRenderEnv
 
@@ -250,7 +250,7 @@ def evaluate(args, model, preprocess, text_cache, device):
                 if traj_at_frame is not None:
                     traj_at_frame.append(None)
             runner = TowerPolicyRunner(
-                model, preprocess, text_cache, sim, args.temperature,
+                model, preprocess, clip_model, sim, args.temperature,
                 args.execution_horizon, args.max_steps, args.sampling_steps, device,
             )
             runner.reset(task.language)
@@ -333,9 +333,7 @@ def build_parser():
     p.add_argument("--suite", default="libero_object", choices=SUITES)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--vae", default="../worlddit_ref/dependencies/Wan2.1_VAE.pth")
-    p.add_argument("--clip", default="../worlddit_ref/dependencies/ViT-B-32.pt",
-                    help="image preprocessing only -- text conditioning comes from --text-cache")
-    p.add_argument("--text-cache", default="/home/ubuntu/dev/wdit/data/libero_object_raw/text_embeddings_umt5.pt")
+    p.add_argument("--clip", default="../worlddit_ref/dependencies/ViT-B-32.pt")
     p.add_argument("--dit-dim", type=int, default=1024)
     p.add_argument("--dit-blocks", type=int, default=10)
     p.add_argument("--dit-heads", type=int, default=16)
@@ -388,15 +386,10 @@ def main():
     model.eval()
     print(f"Loaded checkpoint: {args.checkpoint}")
 
-    _, preprocess = clip.load(str(args.clip), device="cpu")  # image preprocessing only; text goes through UMT5 now
-    text_cache_raw = torch.load(args.text_cache, weights_only=True)
-    text_cache = {
-        "instr_to_idx": {instr: i for i, instr in enumerate(text_cache_raw["instructions"])},
-        "embeddings": text_cache_raw["embeddings"],
-        "lengths": text_cache_raw["lengths"],
-    }
+    clip_model, preprocess = clip.load(str(args.clip), device="cpu")
+    clip_model = clip_model.to(device).eval()
 
-    evaluate(args, model, preprocess, text_cache, device)
+    evaluate(args, model, preprocess, clip_model, device)
 
 
 if __name__ == "__main__":
